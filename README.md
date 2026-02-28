@@ -49,7 +49,7 @@ HealNet/
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/HealNet.git
+   git clone https://github.com/anshikalohan/HealNet.git
    cd HealNet
    ```
 
@@ -81,6 +81,23 @@ HealNet/
    python run.py
    ```
    The server will start at `http://localhost:8000`. API documentation is available at `http://localhost:8000/docs`.
+
+### 🐳 Docker Deployment
+
+HealNet can be easily containerized and run using Docker.
+
+1. **Build and start the container**
+   ```bash
+   docker-compose up --build -d
+   ```
+
+2. **Access the application**
+   The API will be available at `http://localhost:8000`.
+   
+3. **Stop the container**
+   ```bash
+   docker-compose down
+   ```
 
 ## 🛡️ Disclaimer
 
