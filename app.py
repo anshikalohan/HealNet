@@ -6,7 +6,7 @@ import os
 import sqlite3
 import numpy as np
 from PIL import Image
-from tensorflow.keras.models import load_model 
+from tensorflow.keras.models import load_model # type: ignore
 import json
 from datetime import datetime
 import requests
@@ -24,28 +24,33 @@ except Exception:
 
 load_dotenv()
 
+# Initialize Flask app
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
 
+# Configuration
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 GOOGLE_MAPS_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
+# Initialize Twilio client
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
 
+# Initialize Groq client (FREE tier available)
 groq_client = None
 if GROQ_API_KEY and Groq is not None:
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        print("Groq client initialized (FREE)")
+        print("✅ Groq client initialized (FREE)")
     except Exception as e:
-        print(f"Failed to initialize Groq client: {e}")
+        print(f"❌ Failed to initialize Groq client: {e}")
 else:
-    print("GROQ_API_KEY not set or groq SDK not installed - using Hugging Face for chat")
+    print("ℹ️ GROQ_API_KEY not set or groq SDK not installed - using Hugging Face for chat")
 
+# Emergency contacts database
 EMERGENCY_CONTACTS = {
     "India": {
         "ambulance": "108",
@@ -59,6 +64,7 @@ EMERGENCY_CONTACTS = {
     }
 }
 
+# Health Insurance Companies
 HEALTH_INSURANCE_INFO = {
     "companies": [
         {
@@ -88,6 +94,7 @@ HEALTH_INSURANCE_INFO = {
     ]
 }
 
+# Government Financial Aid Schemes
 GOVT_SCHEMES = {
     "schemes": [
         {
@@ -118,6 +125,7 @@ GOVT_SCHEMES = {
     ]
 }
 
+# Disease Awareness Content
 DISEASE_AWARENESS = {
     "dengue": {
         "prevention": "Eliminate stagnant water, use mosquito repellents, wear full-sleeve clothes",
@@ -157,8 +165,10 @@ DISEASE_AWARENESS = {
     }
 }
 
+# Medical disclaimer
 DISCLAIMER = "\n\n⚠️ *अस्वीकरण / Disclaimer:* यह जानकारी केवल शैक्षिक उद्देश्यों के लिए है। कृपया चिकित्सा सलाह के लिए लाइसेंस प्राप्त स्वास्थ्य पेशेवर से परामर्श करें। / This information is for educational purposes only. Please consult a licensed healthcare professional for medical advice."
 
+# Database setup
 def init_db():
     """Initialize SQLite database"""
     conn = sqlite3.connect('healnet.db')
@@ -194,107 +204,183 @@ init_db()
 tf.config.set_visible_devices([], 'GPU')
 
 
-XRAY_MODEL_PATH = "/Users/anshikalohan/Documents/pbl/densenet_model.keras"
+MODELS_PATH = "/Users/anshikalohan/Documents/pbl"
+
+# Helper for safe model loading
+def try_load_model(path):
+    try:
+        model = load_model(path)
+        print(f"✅ Loaded model: {path}")
+        return model
+    except Exception as e:
+        print(f"❌ Failed to load model {path}: {e}")
+        return None
 
 try:
-    xray_model = load_model(XRAY_MODEL_PATH)
-    print("✅ Chest X-ray model loaded successfully")
+    modality_classifier = try_load_model(f"{MODELS_PATH}/modality_classifier.h5")
+    brain_tumor_classifier = try_load_model(f"{MODELS_PATH}/brain_tumor_classifier.h5")
+    skin_cancer_model = try_load_model(f"{MODELS_PATH}/Skin_Cancer.h5")
+    lung_model = try_load_model(f"{MODELS_PATH}/lung_model.keras")
 except Exception as e:
-    print(f"❌ Failed to load X-ray model: {e}")
-    xray_model = None
+    print(f"❌ Global model loading error: {e}")
 
-XRAY_CLASSES = [
-    'Atelectasis',
-    'Cardiomegaly',
-    'Consolidation',
-    'Edema',
-    'Effusion',
-    'Emphysema',
-    'Fibrosis',
-    'Infiltration',
-    'Mass',
-    'Nodule',
-    'Pleural_Thickening',
-    'Pneumonia',
-    'Pneumothorax',
-    'No_Finding'
-]
+CLASSES_MAPPING = {
+    "brain": ['glioma', 'meningioma', 'notumor', 'pituitary'],
+    "skin": ['benign', 'malignant'],
+    "lung": [
+        'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Effusion', 
+        'Emphysema', 'Fibrosis', 'Infiltration', 'Mass', 'Nodule', 'Pleural_Thickening', 
+        'Pneumonia', 'Pneumothorax', 'No_Finding'
+    ]
+}
 
-def preprocess_xray_image(image_bytes):
+def preprocess_image(image_bytes, target_size=(256, 256), scaling='none'):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img = img.resize((256, 256))  
+    img = img.resize(target_size)
+    img_array = np.array(img, dtype=np.float32)
     
-    img_array = np.array(img) / 255.0
+    if scaling == '1/255':
+        img_array = img_array / 255.0
+    elif scaling == 'xception':
+        img_array = (img_array / 127.5) - 1.0
+        
     img_array = np.expand_dims(img_array, axis=0)
-    
     return img_array
 
-def analyze_chest_xray(image_bytes, language='english'):
-    if xray_model is None:
-        return "X-ray model not available." + DISCLAIMER
+def analyze_medical_image(image_bytes, language='english'):
+    if not modality_classifier:
+        return "Models not available." + DISCLAIMER
     
     try:
-        img = preprocess_xray_image(image_bytes)
-        preds = xray_model.predict(img)[0]  
+        # Step 1: Modality classification (EfficientNet expects 0-255 pixels, scaling='none')
+        img_array = preprocess_image(image_bytes, target_size=(224, 224), scaling='none')
         
-        preds_prob = 1 / (1 + np.exp(-preds))  
+        modality_preds = modality_classifier.predict(img_array)[0]
+        modality_idx = int(np.argmax(modality_preds))
         
-        no_finding_idx = XRAY_CLASSES.index("No_Finding")
-        no_finding_conf = preds_prob[no_finding_idx] * 100
-        
-        pathology_findings = []
-        for i in range(14):
-            if XRAY_CLASSES[i] != "No_Finding" and preds_prob[i] > 0.3:  
-                pathology_findings.append((XRAY_CLASSES[i], preds_prob[i] * 100))
-        
-        pathology_findings = sorted(pathology_findings, key=lambda x: x[1], reverse=True)
-        
-        if no_finding_conf > 50 and len(pathology_findings) == 0:
-            if language == 'hindi':
-                response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
-                response += "✅ कोई स्पष्ट असामान्यता नहीं पाई गई\n"
-                response += f"विश्वास स्तर: {no_finding_conf:.1f}%\n\n"
-                response += "फिर भी यदि लक्षण हैं तो डॉक्टर से परामर्श करें।"
-            else:
-                response = "🩻 *Chest X-ray Analysis*\n\n"
-                response += "✅ No significant abnormality detected\n"
-                response += f"Confidence: {no_finding_conf:.1f}%\n\n"
-                response += "Consult a doctor if symptoms persist."
-        
-        elif len(pathology_findings) == 0:
-            if language == 'hindi':
-                response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
-                response += "✅ कोई उच्च-विश्वास असामान्यता नहीं पाई गई\n"
-                response += "सभी रोग संभावनाएं निम्न हैं।\n\n"
-                response += "यदि लक्षण हैं तो डॉक्टर से परामर्श करें।"
-            else:
-                response = "🩻 *Chest X-ray Analysis*\n\n"
-                response += "✅ No high-confidence abnormalities detected\n"
-                response += "All disease probabilities are low.\n\n"
-                response += "Consult a doctor if symptoms persist."
-        
+        if modality_idx == 0:
+            modality = "brain"
+            model = brain_tumor_classifier
+            target_size = (299, 299)
+            scaling = '1/255'
+        elif modality_idx == 1:
+            modality = "lung"
+            model = lung_model
+            target_size = (256, 256)
+            scaling = '1/255'
+        elif modality_idx == 2:
+            modality = "skin"
+            model = skin_cancer_model
+            target_size = (224, 224)
+            scaling = 'none'
         else:
+            return "Unable to determine image modality." + DISCLAIMER
+            
+        if not model:
+            return f"{modality.capitalize()} model not available." + DISCLAIMER
+            
+        # Reprocess for specific model's target size and scaling requirement
+        img_array = preprocess_image(image_bytes, target_size=target_size, scaling=scaling)
+            
+        # Step 2: Specific Pipeline Processing
+        if modality == "brain":
+            preds = model.predict(img_array)[0]
+            pred_idx = np.argmax(preds)
+            pred_class = CLASSES_MAPPING["brain"][pred_idx]
+            conf = float(preds[pred_idx] * 100)
+            
             if language == 'hindi':
-                response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
-                response += "🔎 संभावित स्थितियां:\n"
-                for label, conf in pathology_findings[:5]:  
-                    response += f"• {label} — {conf:.1f}%\n"
-                response += f"\n📊 सामान्य होने की संभावना: {no_finding_conf:.1f}%\n"
-                response += "\n⚠️ कृपया डॉक्टर से पुष्टि कराएं।"
+                response = f"🧠 *ब्रेन एमआरआई विश्लेषण*\n\n"
+                response += f"🔎 स्थिति: *{pred_class}*\n"
+                response += f"विश्वास स्तर: {conf:.1f}%\n\n"
+                response += "⚠️ कृपया डॉक्टर से पुष्टि कराएं।"
             else:
-                response = "🩻 *Chest X-ray Analysis*\n\n"
-                response += "🔎 Detected Potential Conditions:\n"
-                for label, conf in pathology_findings[:5]:
-                    response += f"• {label} — {conf:.1f}%\n"
-                response += f"\n📊 Normal probability: {no_finding_conf:.1f}%\n"
-                response += "\n⚠️ Please consult a doctor for confirmation."
-        
+                response = f"🧠 *Brain MRI Analysis*\n\n"
+                response += f"🔎 Condition: *{pred_class}*\n"
+                response += f"Confidence: {conf:.1f}%\n\n"
+                response += "⚠️ Please consult a doctor for confirmation."
+                
+        elif modality == "skin":
+            preds = model.predict(img_array)[0]
+            if len(preds) == 1:
+                prob = float(preds[0])
+                pred_class = CLASSES_MAPPING["skin"][1] if prob > 0.5 else CLASSES_MAPPING["skin"][0]
+                conf = prob * 100 if prob > 0.5 else (1 - prob) * 100
+            else:
+                pred_idx = np.argmax(preds)
+                pred_class = CLASSES_MAPPING["skin"][pred_idx]
+                conf = float(preds[pred_idx] * 100)
+                
+            if language == 'hindi':
+                response = f"🔍 *त्वचा विश्लेषण*\n\n"
+                response += f"🔎 स्थिति: *{pred_class}*\n"
+                response += f"विश्वास स्तर: {conf:.1f}%\n\n"
+                response += "⚠️ कृपया डॉक्टर से पुष्टि कराएं।"
+            else:
+                response = f"🔍 *Skin Lesion Analysis*\n\n"
+                response += f"🔎 Condition: *{pred_class}*\n"
+                response += f"Confidence: {conf:.1f}%\n\n"
+                response += "⚠️ Please consult a doctor for confirmation."
+                
+        elif modality == "lung":
+            preds = model.predict(img_array)[0]
+            preds_prob = 1 / (1 + np.exp(-preds)) if np.max(preds) > 1 else preds
+            
+            no_finding_idx = CLASSES_MAPPING["lung"].index("No_Finding")
+            no_finding_conf = float(preds_prob[no_finding_idx] * 100)
+            
+            pathology_findings = []
+            for i in range(14):
+                if CLASSES_MAPPING["lung"][i] != "No_Finding" and preds_prob[i] > 0.3:
+                    pathology_findings.append((CLASSES_MAPPING["lung"][i], float(preds_prob[i] * 100)))
+                    
+            pathology_findings = sorted(pathology_findings, key=lambda x: x[1], reverse=True)
+            
+            if no_finding_conf > 50 and len(pathology_findings) == 0:
+                if language == 'hindi':
+                    response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
+                    response += "✅ कोई स्पष्ट असामान्यता नहीं पाई गई\n"
+                    response += f"विश्वास स्तर: {no_finding_conf:.1f}%\n\n"
+                    response += "फिर भी यदि लक्षण हैं तो डॉक्टर से परामर्श करें।"
+                else:
+                    response = "🩻 *Chest X-ray Analysis*\n\n"
+                    response += "✅ No significant abnormality detected\n"
+                    response += f"Confidence: {no_finding_conf:.1f}%\n\n"
+                    response += "Consult a doctor if symptoms persist."
+            elif len(pathology_findings) == 0:
+                if language == 'hindi':
+                    response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
+                    response += "✅ कोई उच्च-विश्वास असामान्यता नहीं पाई गई\n"
+                    response += "सभी रोग संभावनाएं निम्न हैं।\n\n"
+                    response += "यदि लक्षण हैं तो डॉक्टर से परामर्श करें।"
+                else:
+                    response = "🩻 *Chest X-ray Analysis*\n\n"
+                    response += "✅ No high-confidence abnormalities detected\n"
+                    response += "All disease probabilities are low.\n\n"
+                    response += "Consult a doctor if symptoms persist."
+            else:
+                if language == 'hindi':
+                    response = "🩻 *छाती एक्स-रे विश्लेषण*\n\n"
+                    response += "🔎 संभावित स्थितियां:\n"
+                    for label, conf in pathology_findings[:5]:
+                        response += f"• {label} — {conf:.1f}%\n"
+                    response += f"\n📊 सामान्य होने की संभावना: {no_finding_conf:.1f}%\n"
+                    response += "\n⚠️ कृपया डॉक्टर से पुष्टि कराएं।"
+                else:
+                    response = "🩻 *Chest X-ray Analysis*\n\n"
+                    response += "🔎 Detected Potential Conditions:\n"
+                    for label, conf in pathology_findings[:5]:
+                        response += f"• {label} — {conf:.1f}%\n"
+                    response += f"\n📊 Normal probability: {no_finding_conf:.1f}%\n"
+                    response += "\n⚠️ Please consult a doctor for confirmation."
+
         return response + DISCLAIMER
     
     except Exception as e:
-        print(f"X-ray analysis error: {e}")
-        return "Failed to analyze X-ray image." + DISCLAIMER
+        print(f"Medical analysis error: {e}")
+        return "Failed to analyze image." + DISCLAIMER
 
+# Helper Functions
 def log_interaction(intent, language, success=True, location=None):
     """Log anonymized chat metadata"""
     try:
@@ -597,10 +683,12 @@ Hindi, English supported!
 
 def get_groq_chat_response(message, language='english'):
     """Get response from Groq (primary) with HF fallback."""
+    # Check for greetings
     greetings = ["hello", "hi", "hey", "start", "help", "hii", "helo", "namaste", "नमस्ते", "hola", "bonjour"]
     if any(greeting == message.lower().strip() for greeting in greetings):
         return get_greeting_response(language)
     
+    # Check cache
     cached = get_cached_response(message)
     if cached and not cached.endswith("[Offline Mode]"):
         print("📦 Using cached response")
@@ -632,6 +720,7 @@ def get_groq_chat_response(message, language='english'):
         print(f"⚠️ Groq chat error: {type(e).__name__}: {str(e)} - falling back to Hugging Face")
     
 
+# Alias for existing callers
 get_openai_response = get_groq_chat_response
 
 def get_fallback_response(message, language='english'):
@@ -682,21 +771,25 @@ def find_nearby_facilities(location_query, facility_type="hospital", language='e
             "User-Agent": "HealNet/1.0 (contact: support@healnet.local)"
         }
         
+        # Resolve location to coordinates and a friendly address
         coord_match = re.match(r'^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$', str(location_query))
         if coord_match:
             lat, lng = coord_match.groups()
             location_str = f"{lat},{lng}"
+            # Reverse geocode with Nominatim
             rev_url = "https://nominatim.openstreetmap.org/reverse"
             rev_params = {"lat": lat, "lon": lng, "format": "jsonv2"}
             rev_resp = requests.get(rev_url, params=rev_params, headers=headers, timeout=10)
             rev_data = rev_resp.json() if rev_resp.status_code == 200 else {}
             formatted_address = rev_data.get('display_name', location_str)
         else:
+            # Geocode with Nominatim
             geocode_url = "https://nominatim.openstreetmap.org/search"
             geocode_params = {"q": location_query, "format": "jsonv2", "limit": 1, "countrycodes": "in"}
             geo_resp = requests.get(geocode_url, params=geocode_params, headers=headers, timeout=10)
             geo_data = geo_resp.json() if geo_resp.status_code == 200 else []
             if not geo_data:
+                # Retry without country bias
                 geocode_params = {"q": location_query, "format": "jsonv2", "limit": 1}
                 geo_resp = requests.get(geocode_url, params=geocode_params, headers=headers, timeout=10)
                 geo_data = geo_resp.json() if geo_resp.status_code == 200 else []
@@ -709,29 +802,45 @@ def find_nearby_facilities(location_query, facility_type="hospital", language='e
         
         print(f"✅ [OSM] Location found: {formatted_address}")
         
+        # Map facility types to OSM amenities
         amenity_tags = {
-            "hospital": ["hospital"],
+            "hospital": ["hospital", "clinic", "doctors"], # Fallback to clinics if hospital missing
             "clinic": ["clinic", "doctors"],
-            "pharmacy": ["pharmacy"],
-            "doctor": ["doctors", "clinic"]
+            "pharmacy": ["pharmacy", "chemist"],
+            "doctor": ["doctors", "clinic", "hospital"]
         }
-        tags = amenity_tags.get(facility_type, ["hospital"])
+        tags = amenity_tags.get(facility_type, ["hospital", "clinic", "doctors"])
         
-        overpass_url = "https://overpass-api.de/api/interpreter"
-        radius_m = 5000
+        # Overpass endpoints for reliability
+        overpass_urls = [
+            "https://lz4.overpass-api.de/api/interpreter",
+            "https://z.overpass-api.de/api/interpreter",
+            "https://overpass-api.de/api/interpreter"
+        ]
+        
         lat_f, lng_f = float(lat), float(lng)
-        or_filters = "".join([f'node["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});way["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});relation["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});' for t in tags])
-        query = f"[out:json][timeout:25];({or_filters});out center 20;"
+        elements = []
         
-        ov_resp = requests.post(overpass_url, data={"data": query}, headers=headers, timeout=25)
-        if ov_resp.status_code != 200:
-            print(f"⚠️ Overpass status: {ov_resp.status_code}")
-            msg = f"No {facility_type}s found near {formatted_address}" if language == 'english' else f"{formatted_address} के पास कोई {facility_type} नहीं मिला"
-            return msg
-        ov_data = ov_resp.json()
-        elements = ov_data.get("elements", [])
+        for radius_m in [5000, 15000]: # Expand from 5km to 15km if nothing found
+            or_filters = "".join([f'node["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});way["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});relation["amenity"="{t}"](around:{radius_m},{lat_f},{lng_f});' for t in tags])
+            query = f"[out:json][timeout:25];({or_filters});out center 20;"
+            
+            for overpass_url in overpass_urls:
+                try:
+                    ov_resp = requests.post(overpass_url, data={"data": query}, headers=headers, timeout=25)
+                    if ov_resp.status_code == 200:
+                        ov_data = ov_resp.json()
+                        elements = ov_data.get("elements", [])
+                        if elements:
+                            break # Found something, exit api loop
+                except Exception as e:
+                    print(f"⚠️ Overpass request error at {overpass_url}: {e}")
+            
+            if elements:
+                break # Exit radius loop
+                
         if not elements:
-            msg = f"No {facility_type}s found near {formatted_address}" if language == 'english' else f"{formatted_address} के पास कोई {facility_type} नहीं मिला"
+            msg = f"No {facility_type}s found near {formatted_address} (within 15km). (Map servers may be overloaded)" if language == 'english' else f"{formatted_address} के दायरे में कोई {facility_type} नहीं मिला।"
             return msg
         
         facilities = []
@@ -740,9 +849,16 @@ def find_nearby_facilities(location_query, facility_type="hospital", language='e
             name = tags.get("name", "N/A")
             address_parts = [tags.get("addr:street"), tags.get("addr:city"), tags.get("addr:state")]
             addr = ", ".join([p for p in address_parts if p]) or formatted_address
+            
+            lat = el.get("lat") or el.get("center", {}).get("lat")
+            lon = el.get("lon") or el.get("center", {}).get("lon")
+            # Using maps.google.com/?q= format to avoid XML ampersand parsing crash in Twilio WhatsApp
+            gmaps_link = f"https://maps.google.com/?q={lat},{lon}" if lat and lon else ""
+            
             facilities.append({
                 "name": name,
                 "address": addr,
+                "gmaps_link": gmaps_link,
                 "rating": "N/A",
                 "open": None
             })
@@ -767,26 +883,30 @@ def format_facilities_response(facilities, facility_type, language='english', lo
         for i, facility in enumerate(facilities, 1):
             response += f"{i}. *{facility['name']}*\n"
             response += f"   📍 {facility['address']}\n"
+            if facility.get('gmaps_link'):
+                response += f"   🗺️ लिंक: {facility['gmaps_link']}\n"
             response += f"   ⭐ रेटिंग: {facility['rating']}/5\n"
             if facility['open'] is not None:
                 status = "खुला है ✅" if facility['open'] else "बंद है ❌"
                 response += f"   🕒 अभी {status}\n"
             response += "\n"
         
-        response += "\n💡 Google Maps पर खोलने के लिए नाम कॉपी करें"
+        response += "\n💡 Google Maps पर खोलने के लिए लिंक पर क्लिक करें"
     else:
         response = f"🏥 *{facility_type.title()}s near {location}:*\n\n"
         
         for i, facility in enumerate(facilities, 1):
             response += f"{i}. *{facility['name']}*\n"
             response += f"   📍 {facility['address']}\n"
+            if facility.get('gmaps_link'):
+                response += f"   🗺️ Link: {facility['gmaps_link']}\n"
             response += f"   ⭐ Rating: {facility['rating']}/5\n"
             if facility['open'] is not None:
                 status = "Open now ✅" if facility['open'] else "Closed ❌"
                 response += f"   🕒 {status}\n"
             response += "\n"
         
-        response += "\n💡 Copy name to open in Google Maps"
+        response += "\n💡 Click the links to open in Google Maps"
     
     return response
 
@@ -794,17 +914,21 @@ def handle_intent(message, language='english'):
     """Detect user intent and route to appropriate handler"""
     message_lower = message.lower()
     
+    # Emergency
     if detect_emergency(message):
         return "emergency", get_emergency_response(language)
     
+    # Insurance info
     insurance_keywords = ['insurance', 'बीमा', 'policy', 'पॉलिसी']
     if any(keyword in message_lower for keyword in insurance_keywords):
         return "insurance", get_insurance_info(language)
     
+    # Government schemes
     scheme_keywords = ['scheme', 'योजना', 'ayushman', 'आयुष्मान', 'pmjay', 'financial aid', 'सरकारी', 'government']
     if any(keyword in message_lower for keyword in scheme_keywords):
         return "schemes", get_govt_schemes(language)
     
+    # Disease awareness
     awareness_keywords = ['dengue', 'डेंगू', 'malaria', 'मलेरिया', 'tuberculosis', 'tb', 'टीबी', 
                           'covid', 'कोविड', 'diabetes', 'मधुमेह', 'hypertension', 'उच्च रक्तचाप']
     for keyword in awareness_keywords:
@@ -813,14 +937,19 @@ def handle_intent(message, language='english'):
                 if disease in message_lower or keyword in disease:
                     return "awareness", get_disease_awareness(disease, language)
     
+    # Location/facilities - robust pattern matching (avoid false matches like 'vomiting')
     facility_words = ['hospital', 'अस्पताल', 'clinic', 'क्लिनिक', 'pharmacy', 'फार्मेसी', 'doctor', 'डॉक्टर']
     has_facility_word = any(word in message_lower for word in facility_words)
     has_action_word = re.search(r'\b(find|locate|search|खोजें)\b', message_lower) is not None
     has_location_prep = re.search(r'\b(in|near|at)\b', message_lower) is not None or (' में ' in f' {message_lower} ') or (' पास ' in f' {message_lower} ')
     
+    # Trigger location intent only when it's clearly a location query:
+    # 1) contains a facility word and a location preposition, or
+    # 2) contains an action word and a location preposition
     if (has_facility_word and has_location_prep) or (has_action_word and has_location_prep):
         return "location_request", None
     
+    # Default: health query using AI
     return "health_query", None
 
 @app.route('/webhook', methods=['POST'])
@@ -831,6 +960,7 @@ def webhook():
         from_number = request.values.get('From', '')
         media_url = request.values.get('MediaUrl0', None)
         media_type = request.values.get('MediaContentType0', None)
+        # WhatsApp location payload (Twilio sends Latitude/Longitude on location share)
         lat = request.values.get('Latitude') or request.values.get('Latitude0')
         lng = request.values.get('Longitude') or request.values.get('Longitude0')
         loc_address = request.values.get('Address') or request.values.get('Address0')
@@ -844,8 +974,10 @@ def webhook():
             print(f"📍 Location shared: {lat},{lng} ({loc_address or 'No address'})")
         print(f"{'='*60}\n")
         
+        # Get user's preferred language
         user_language = get_user_language(from_number)
         
+        # Detect language from message
         if incoming_msg:
             detected_lang = detect_language(incoming_msg)
             if detected_lang != user_language:
@@ -855,13 +987,16 @@ def webhook():
         resp = MessagingResponse()
         response_text = ""
         
+        # Handle language setting
         if incoming_msg.lower() in ['english', 'hindi', 'हिंदी', 'अंग्रेजी']:
             lang = 'hindi' if 'hindi' in incoming_msg.lower() or 'हिंदी' in incoming_msg else 'english'
             set_user_language(from_number, lang)
             msg = f"भाषा हिंदी में सेट की गई। 🇮🇳" if lang == 'hindi' else "Language set to English. 🇬🇧"
             response_text = msg + "\n\n" + get_greeting_response(lang)
         
+        # Handle shared live location (high priority)
         if lat and lng:
+            # Determine facility type from the text if specified
             facility_type = "hospital"
             if any(word in incoming_msg.lower() for word in ["pharmacy", "फार्मेसी", "medical store", "chemist"]):
                 facility_type = "pharmacy"
@@ -891,8 +1026,8 @@ def webhook():
 
                 image_data = image_response.content
 
-                response_text = analyze_chest_xray(image_data, user_language)
-                log_interaction("chest_xray_analysis", user_language, True)
+                response_text = analyze_medical_image(image_data, user_language)
+                log_interaction("medical_image_analysis", user_language, True)
 
             except Exception as e:
                 print(f"❌ Image processing error: {e}")
@@ -900,22 +1035,29 @@ def webhook():
                 response_text = msg + DISCLAIMER
 
                         
+        
+        # Handle text messages - FIXED
         elif incoming_msg:
             intent, direct_response = handle_intent(incoming_msg, user_language)
             
             if intent == "location_request":
+                # Enhanced location extraction
                 location = None
                 
+                # Pattern 1: "find X in Y" or "find X near Y"
                 match = re.search(r'(?:find|locate|search|खोजें)\s+(?:\w+\s+)?(?:in|near|at|में|पास)\s+(.+)', incoming_msg, re.IGNORECASE)
                 if match:
                     location = match.group(1).strip()
                 
+                # Pattern 2: "X in Y" format
                 if not location:
                     match = re.search(r'(?:hospital|clinic|pharmacy|doctor|अस्पताल|क्लिनिक|फार्मेसी)\s+(?:in|near|at|में|पास)\s+(.+)', incoming_msg, re.IGNORECASE)
                     if match:
                         location = match.group(1).strip()
                 
+                # Pattern 3: Just city name mentioned
                 if not location:
+                    # Extract any word that might be a location
                     words = incoming_msg.split()
                     for i, word in enumerate(words):
                         if word.lower() in ['in', 'near', 'at', 'में', 'पास'] and i + 1 < len(words):
@@ -923,6 +1065,7 @@ def webhook():
                             break
                 
                 if location:
+                    # Determine facility type
                     facility_type = "hospital"
                     if any(word in incoming_msg.lower() for word in ["pharmacy", "फार्मेसी", "medical store", "chemist"]):
                         facility_type = "pharmacy"
@@ -942,12 +1085,15 @@ def webhook():
                 log_interaction(intent, user_language, True)
             
             else:
+                # AI-powered health query
                 response_text = get_openai_response(incoming_msg, user_language)
                 log_interaction("health_query", user_language, True)
         
         else:
+            # Empty message - send greeting
             response_text = get_greeting_response(user_language)
         
+        # Send response in chunks (WhatsApp limit: 1600 chars)
         if response_text:
             print(f"📤 Sending response: {len(response_text)} characters")
             chunk_size = 1500
@@ -955,6 +1101,7 @@ def webhook():
             if len(response_text) <= chunk_size:
                 resp.message(response_text)
             else:
+                # Split into chunks at sentence boundaries
                 chunks = []
                 current_chunk = ""
                 sentences = response_text.split('\n')
