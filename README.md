@@ -116,7 +116,7 @@ HealNet bridges these gaps with multimodal, multilingual, and WhatsApp-based acc
 ## Installation & Setup
 
 ```bash
-git clone https://github.com/your-username/healnet.git
+git clone https://github.com/anshikalohan/healnet.git
 cd healnet
 pip install -r requirements.txt
 python app.py
